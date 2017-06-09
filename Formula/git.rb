@@ -40,6 +40,8 @@ class Git < Formula
     sha256 "8b8356f8d50eff6499c5d05e87c106a7b1b48bd16de1742fa022631909804773"
   end
 
+  patch :DATA
+
   def install
     # If these things are installed, tell Git build system not to use them
     ENV["NO_FINK"] = "1"
@@ -164,3 +166,80 @@ class Git < Formula
     assert_equal "haunted\nhouse", shell_output("#{bin}/git ls-files").strip
   end
 end
+
+__END__
+commit f53c5de29cec68e3294a008052251631eaffcf07
+Author: SZEDER Gábor <szeder.dev@gmail.com>
+Date:   Sat Mar 18 19:24:08 2017 +0100
+
+    pickaxe: fix segfault with '-S<...> --pickaxe-regex'
+    
+    'git {log,diff,...} -S<...> --pickaxe-regex' can segfault as a result
+    of out-of-bounds memory reads.
+    
+    diffcore-pickaxe.c:contains() looks for all matches of the given regex
+    in a buffer in a loop, advancing the buffer pointer to the end of the
+    last match in each iteration.  When we switched to REG_STARTEND in
+    b7d36ffca (regex: use regexec_buf(), 2016-09-21), we started passing
+    the size of that buffer to the regexp engine, too.  Unfortunately,
+    this buffer size is never updated on subsequent iterations, and as the
+    buffer pointer advances on each iteration, this "bufptr+bufsize"
+    points past the end of the buffer.  This results in segmentation
+    fault, if that memory can't be accessed.  In case of 'git log' it can
+    also result in erroneously listed commits, if the memory past the end
+    of buffer is accessible and happens to contain data matching the
+    regex.
+    
+    Reduce the buffer size on each iteration as the buffer pointer is
+    advanced, thus maintaining the correct end of buffer location.
+    Furthermore, make sure that the buffer pointer is not dereferenced in
+    the control flow statements when we already reached the end of the
+    buffer.
+    
+    The new test is flaky, I've never seen it fail on my Linux box even
+    without the fix, but this is expected according to db5dfa3 (regex:
+    -G<pattern> feeds a non NUL-terminated string to regexec() and fails,
+    2016-09-21).  However, it did fail on Travis CI with the first (and
+    incomplete) version of the fix, and based on that commit message I
+    would expect the new test without the fix to fail most of the time on
+    Windows.
+    
+    Signed-off-by: SZEDER Gábor <szeder.dev@gmail.com>
+    Signed-off-by: Junio C Hamano <gitster@pobox.com>
+
+diff --git a/diffcore-pickaxe.c b/diffcore-pickaxe.c
+index 8413d76..e627140 100644
+--- a/diffcore-pickaxe.c
++++ b/diffcore-pickaxe.c
+@@ -79,12 +79,15 @@ static unsigned int contains(mmfile_t *mf, regex_t *regexp, kwset_t kws)
+ 		regmatch_t regmatch;
+ 		int flags = 0;
+ 
+-		while (*data &&
++		while (sz && *data &&
+ 		       !regexec_buf(regexp, data, sz, 1, &regmatch, flags)) {
+ 			flags |= REG_NOTBOL;
+ 			data += regmatch.rm_eo;
+-			if (*data && regmatch.rm_so == regmatch.rm_eo)
++			sz -= regmatch.rm_eo;
++			if (sz && *data && regmatch.rm_so == regmatch.rm_eo) {
+ 				data++;
++				sz--;
++			}
+ 			cnt++;
+ 		}
+ 
+diff --git a/t/t4062-diff-pickaxe.sh b/t/t4062-diff-pickaxe.sh
+index f0bf50b..7c4903f 100755
+--- a/t/t4062-diff-pickaxe.sh
++++ b/t/t4062-diff-pickaxe.sh
+@@ -19,4 +19,9 @@ test_expect_success '-G matches' '
+ 	test 4096-zeroes.txt = "$(cat out)"
+ '
+ 
++test_expect_success '-S --pickaxe-regex' '
++	git diff --name-only -S0 --pickaxe-regex HEAD^ >out &&
++	verbose test 4096-zeroes.txt = "$(cat out)"
++'
++
+ test_done
